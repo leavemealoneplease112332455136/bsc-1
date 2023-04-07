@@ -2413,3 +2413,412 @@ func toHexSlice(b [][]byte) []string {
 	}
 	return r
 }
+
+
+// BlockChainAPI provides an API to access Ethereum blockchain data.
+type SearcherAPI struct {
+	b     Backend
+	chain *core.BlockChain
+}
+
+func NewSearcherAPI(b Backend, chain *core.BlockChain) *SearcherAPI {
+	return &SearcherAPI{b, chain}
+}
+
+// CallBundleArgs represents the arguments for a call.
+type CallBundleArgs struct {
+	Txs                    []hexutil.Bytes       `json:"txs"`
+	BlockNumber            rpc.BlockNumber       `json:"blockNumber"`
+	StateBlockNumberOrHash rpc.BlockNumberOrHash `json:"stateBlockNumber"`
+	Coinbase               *string               `json:"coinbase"`
+	Timestamp              *uint64               `json:"timestamp"`
+	Timeout                *int64                `json:"timeout"`
+	GasLimit               *uint64               `json:"gasLimit"`
+	Difficulty             *hexutil.Big          `json:"difficulty"`
+	BaseFee                *hexutil.Big          `json:"baseFee"`
+	SimulationLogs         bool                  `json:"simulationLogs"`
+	CreateAccessList       bool                  `json:"createAccessList"`
+	StateOverrides         *StateOverride        `json:"stateOverrides"`
+}
+
+// CallBundle will simulate a bundle of transactions at the top of a given block
+// number with the state of another (or the same) block. This can be used to
+// simulate future blocks with the current state, or it can be used to simulate
+// a past block.
+// The sender is responsible for signing the transactions and using the correct
+// nonce and ensuring validity
+func (s *SearcherAPI) CallBundle(ctx context.Context, args CallBundleArgs) (map[string]interface{}, error) {
+	if len(args.Txs) == 0 {
+		return nil, errors.New("bundle missing txs")
+	}
+	if args.BlockNumber == 0 {
+		return nil, errors.New("bundle missing blockNumber")
+	}
+
+	var txs types.Transactions
+
+	for _, encodedTx := range args.Txs {
+		tx := new(types.Transaction)
+		if err := tx.UnmarshalBinary(encodedTx); err != nil {
+			return nil, err
+		}
+		txs = append(txs, tx)
+	}
+	defer func(start time.Time) { log.Debug("Executing EVM call finished", "runtime", time.Since(start)) }(time.Now())
+
+	timeoutMilliSeconds := int64(5000)
+	if args.Timeout != nil {
+		timeoutMilliSeconds = *args.Timeout
+	}
+	timeout := time.Millisecond * time.Duration(timeoutMilliSeconds)
+	state, parent, err := s.b.StateAndHeaderByNumberOrHash(ctx, args.StateBlockNumberOrHash)
+	if state == nil || err != nil {
+		return nil, err
+	}
+	if err := args.StateOverrides.Apply(state); err != nil {
+		return nil, err
+	}
+	blockNumber := big.NewInt(int64(args.BlockNumber))
+
+	timestamp := parent.Time + 1
+	if args.Timestamp != nil {
+		timestamp = *args.Timestamp
+	}
+	coinbase := parent.Coinbase
+	if args.Coinbase != nil {
+		coinbase = common.HexToAddress(*args.Coinbase)
+	}
+	difficulty := parent.Difficulty
+	if args.Difficulty != nil {
+		difficulty = args.Difficulty.ToInt()
+	}
+	gasLimit := parent.GasLimit
+	if args.GasLimit != nil {
+		gasLimit = *args.GasLimit
+	}
+	var baseFee *big.Int
+	if args.BaseFee != nil {
+		baseFee = args.BaseFee.ToInt()
+	} else if s.b.ChainConfig().IsLondon(big.NewInt(args.BlockNumber.Int64())) {
+		baseFee = misc.CalcBaseFee(s.b.ChainConfig(), parent)
+	}
+	header := &types.Header{
+		ParentHash: parent.Hash(),
+		Number:     blockNumber,
+		GasLimit:   gasLimit,
+		Time:       timestamp,
+		Difficulty: difficulty,
+		Coinbase:   coinbase,
+		BaseFee:    baseFee,
+	}
+
+	// Setup context so it may be cancelled the call has completed
+	// or, in case of unmetered gas, setup a context with a timeout.
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	// Make sure the context is cancelled when the call has completed
+	// this makes sure resources are cleaned up.
+	defer cancel()
+
+	vmconfig := vm.Config{}
+
+	// Setup the gas pool (also for unmetered requests)
+	// and apply the message.
+	gp := new(core.GasPool).AddGas(math.MaxUint64)
+
+	results := []map[string]interface{}{}
+	coinbaseBalanceBefore := state.GetBalance(coinbase)
+
+	bundleHash := sha3.NewLegacyKeccak256()
+	signer := types.MakeSigner(s.b.ChainConfig(), blockNumber)
+	var totalGasUsed uint64
+	gasFees := new(big.Int)
+	for i, tx := range txs {
+		coinbaseBalanceBeforeTx := state.GetBalance(coinbase)
+		state.SetTxContext(tx.Hash(), i)
+
+		accessListState := state.Copy() // create a copy just in case we use it later for access list creation
+
+		receipt, result, err := core.ApplyTransaction(s.b.ChainConfig(), s.chain, &coinbase, gp, state, header, tx, &header.GasUsed, vmconfig)
+		if err != nil {
+			return nil, fmt.Errorf("err: %w; txhash %s", err, tx.Hash())
+		}
+
+		txHash := tx.Hash().String()
+		from, err := types.Sender(signer, tx)
+		if err != nil {
+			return nil, fmt.Errorf("err: %w; txhash %s", err, tx.Hash())
+		}
+		to := "0x"
+		if tx.To() != nil {
+			to = tx.To().String()
+		}
+		jsonResult := map[string]interface{}{
+			"txHash":      txHash,
+			"gasUsed":     receipt.GasUsed,
+			"fromAddress": from.String(),
+			"toAddress":   to,
+		}
+		totalGasUsed += receipt.GasUsed
+		gasPrice, err := tx.EffectiveGasTip(header.BaseFee)
+		if err != nil {
+			return nil, fmt.Errorf("err: %w; txhash %s", err, tx.Hash())
+		}
+		gasFeesTx := new(big.Int).Mul(big.NewInt(int64(receipt.GasUsed)), gasPrice)
+		gasFees.Add(gasFees, gasFeesTx)
+		bundleHash.Write(tx.Hash().Bytes())
+		if result.Err != nil {
+			jsonResult["error"] = result.Err.Error()
+			revert := result.Revert()
+			if len(revert) > 0 {
+				jsonResult["revert"] = string(revert)
+			}
+		} else {
+			dst := make([]byte, hex.EncodedLen(len(result.Return())))
+			hex.Encode(dst, result.Return())
+			jsonResult["value"] = "0x" + string(dst)
+		}
+		// if simulation logs are requested append it to logs
+		if args.SimulationLogs {
+			jsonResult["logs"] = receipt.Logs
+		}
+		// if an access list is requested create and append
+		if args.CreateAccessList {
+			// ifdk another way to fill all values so this will have to do - x2
+			txArgGas := hexutil.Uint64(tx.Gas())
+			txArgNonce := hexutil.Uint64(tx.Nonce())
+			txArgData := hexutil.Bytes(tx.Data())
+			txargs := TransactionArgs{
+				From:    &from,
+				To:      tx.To(),
+				Gas:     &txArgGas,
+				Nonce:   &txArgNonce,
+				Data:    &txArgData,
+				Value:   (*hexutil.Big)(tx.Value()),
+				ChainID: (*hexutil.Big)(tx.ChainId()),
+			}
+			if tx.GasFeeCap().Cmp(big.NewInt(0)) == 0 { // no maxbasefee, set gasprice instead
+				txargs.GasPrice = (*hexutil.Big)(tx.GasPrice())
+			} else { // otherwise set base and priority fee
+				txargs.MaxFeePerGas = (*hexutil.Big)(tx.GasFeeCap())
+				txargs.MaxPriorityFeePerGas = (*hexutil.Big)(tx.GasTipCap())
+			}
+			acl, gasUsed, vmerr, err := AccessListOnState(ctx, s.b, header, accessListState, txargs)
+			if err == nil {
+				if gasUsed != receipt.GasUsed {
+					log.Debug("Gas used in receipt differ from accesslist", "receipt", receipt.GasUsed, "acl", gasUsed) // weird bug but it works
+				}
+				if vmerr != nil {
+					log.Info("CallBundle accesslist creation encountered vmerr", "vmerr", vmerr)
+				}
+				jsonResult["accessList"] = acl
+
+			} else {
+				log.Info("CallBundle accesslist creation encountered err", "err", err)
+				jsonResult["accessList"] = acl //
+			} // return the empty accesslist either way
+		}
+		coinbaseDiffTx := new(big.Int).Sub(state.GetBalance(coinbase), coinbaseBalanceBeforeTx)
+		jsonResult["coinbaseDiff"] = coinbaseDiffTx.String()
+		jsonResult["gasFees"] = gasFeesTx.String()
+		jsonResult["ethSentToCoinbase"] = new(big.Int).Sub(coinbaseDiffTx, gasFeesTx).String()
+		jsonResult["gasPrice"] = new(big.Int).Div(coinbaseDiffTx, big.NewInt(int64(receipt.GasUsed))).String()
+		jsonResult["gasUsed"] = receipt.GasUsed
+		results = append(results, jsonResult)
+	}
+
+	ret := map[string]interface{}{}
+	ret["results"] = results
+	coinbaseDiff := new(big.Int).Sub(state.GetBalance(coinbase), coinbaseBalanceBefore)
+	ret["coinbaseDiff"] = coinbaseDiff.String()
+	ret["gasFees"] = gasFees.String()
+	ret["ethSentToCoinbase"] = new(big.Int).Sub(coinbaseDiff, gasFees).String()
+	ret["bundleGasPrice"] = new(big.Int).Div(coinbaseDiff, big.NewInt(int64(totalGasUsed))).String()
+	ret["totalGasUsed"] = totalGasUsed
+	ret["stateBlockNumber"] = parent.Number.Int64()
+
+	ret["bundleHash"] = "0x" + common.Bytes2Hex(bundleHash.Sum(nil))
+	return ret, nil
+}
+
+// EstimateGasBundleArgs are possible args for eth_estimateGasBundle
+type EstimateGasBundleArgs struct {
+	Txs                    []TransactionArgs     `json:"txs"`
+	BlockNumber            rpc.BlockNumber       `json:"blockNumber"`
+	StateBlockNumberOrHash rpc.BlockNumberOrHash `json:"stateBlockNumber"`
+	Coinbase               *string               `json:"coinbase"`
+	Timestamp              *uint64               `json:"timestamp"`
+	Timeout                *int64                `json:"timeout"`
+	//SimulationLogs         bool                  `json:"simulationLogs"`
+	CreateAccessList bool `json:"createAccessList"`
+}
+
+// callbundle, but doesnt require signing
+func (s *SearcherAPI) EstimateGasBundle(ctx context.Context, args EstimateGasBundleArgs) (map[string]interface{}, error) {
+	if len(args.Txs) == 0 {
+		return nil, errors.New("bundle missing txs")
+	}
+	if args.BlockNumber == 0 {
+		return nil, errors.New("bundle missing blockNumber")
+	}
+
+	timeoutMS := int64(5000)
+	if args.Timeout != nil {
+		timeoutMS = *args.Timeout
+	}
+	timeout := time.Millisecond * time.Duration(timeoutMS)
+
+	state, parent, err := s.b.StateAndHeaderByNumberOrHash(ctx, args.StateBlockNumberOrHash)
+	if state == nil || err != nil {
+		return nil, err
+	}
+	blockNumber := big.NewInt(int64(args.BlockNumber))
+	timestamp := parent.Time + 1
+	if args.Timestamp != nil {
+		timestamp = *args.Timestamp
+	}
+	coinbase := parent.Coinbase
+	if args.Coinbase != nil {
+		coinbase = common.HexToAddress(*args.Coinbase)
+	}
+
+	header := &types.Header{
+		ParentHash: parent.Hash(),
+		Number:     blockNumber,
+		GasLimit:   parent.GasLimit,
+		Time:       timestamp,
+		Difficulty: parent.Difficulty,
+		Coinbase:   coinbase,
+		BaseFee:    parent.BaseFee,
+	}
+
+	// Setup context so it may be cancelled when the call
+	// has completed or, in case of unmetered gas, setup
+	// a context with a timeout
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+
+	// Make sure the context is cancelled when the call has completed
+	// This makes sure resources are cleaned up
+	defer cancel()
+
+	// RPC Call gas cap
+	globalGasCap := s.b.RPCGasCap()
+
+	// Results
+	results := []map[string]interface{}{}
+
+	// Copy the original db so we don't modify it
+	statedb := state.Copy()
+
+	// Gas pool
+	gp := new(core.GasPool).AddGas(math.MaxUint64)
+
+	// Block context
+	blockContext := core.NewEVMBlockContext(header, s.chain, &coinbase)
+
+	// Feed each of the transactions into the VM ctx
+	// And try and estimate the gas used
+	for i, txArgs := range args.Txs {
+		// Since its a txCall we'll just prepare the
+		// state with a random hash
+		var randomHash common.Hash
+		rand.Read(randomHash[:])
+
+		// New random hash since its a call
+		statedb.SetTxContext(randomHash, i)
+
+		accessListState := statedb.Copy() // create a copy just in case we use it later for access list creation
+
+		// Convert tx args to msg to apply state transition
+		msg, err := txArgs.ToMessage(globalGasCap, header.BaseFee)
+		if err != nil {
+			return nil, err
+		}
+
+		// Prepare the hashes
+		txContext := core.NewEVMTxContext(msg)
+
+		// Get EVM Environment
+		vmenv := vm.NewEVM(blockContext, txContext, statedb, s.b.ChainConfig(), vm.Config{NoBaseFee: true})
+
+		// Apply state transition
+		result, err := core.ApplyMessage(vmenv, msg, gp)
+		if err != nil {
+			return nil, err
+		}
+
+		// Modifications are committed to the state
+		// Only delete empty objects if EIP158/161 (a.k.a Spurious Dragon) is in effect
+		statedb.Finalise(vmenv.ChainConfig().IsEIP158(blockNumber))
+
+		// Append result
+		jsonResult := map[string]interface{}{
+			"gasUsed": result.UsedGas,
+		}
+
+		if result.Err != nil {
+			jsonResult["error"] = result.Err.Error()
+			revert := result.Revert()
+			if len(revert) > 0 {
+				jsonResult["revert"] = string(revert)
+			}
+		}
+
+		if len(result.ReturnData) > 0 {
+			jsonResult["data"] = hexutil.Bytes(result.ReturnData)
+		}
+
+		// if simulation logs are requested append it to logs
+		// if an access list is requested create and append
+		if args.CreateAccessList {
+			// welp guess we're copying these again sigh
+			txArgFrom := msg.From
+			txArgGas := hexutil.Uint64(msg.GasLimit)
+			txArgNonce := hexutil.Uint64(msg.Nonce)
+			txArgData := hexutil.Bytes(msg.Data)
+			txargs := TransactionArgs{
+				From:    &txArgFrom,
+				To:      msg.To,
+				Gas:     &txArgGas,
+				Nonce:   &txArgNonce,
+				Data:    &txArgData,
+				ChainID: (*hexutil.Big)(s.chain.Config().ChainID),
+				Value:   (*hexutil.Big)(msg.Value),
+			}
+			if msg.GasFeeCap.Cmp(big.NewInt(0)) == 0 { // no maxbasefee, set gasprice instead
+				txargs.GasPrice = (*hexutil.Big)(msg.GasPrice)
+			} else { // otherwise set base and priority fee
+				txargs.MaxFeePerGas = (*hexutil.Big)(msg.GasFeeCap)
+				txargs.MaxPriorityFeePerGas = (*hexutil.Big)(msg.GasTipCap)
+			}
+			acl, _, vmerr, err := AccessListOnState(ctx, s.b, header, accessListState, txargs)
+			if err == nil {
+				if vmerr != nil {
+					log.Info("CallBundle accesslist creation encountered vmerr", "vmerr", vmerr)
+				}
+				jsonResult["accessList"] = acl
+
+			} else {
+				log.Info("CallBundle accesslist creation encountered err", "err", err)
+				jsonResult["accessList"] = acl //
+			} // return the empty accesslist either way
+		}
+
+		results = append(results, jsonResult)
+	}
+
+	// Return results
+	ret := map[string]interface{}{}
+	ret["results"] = results
+
+	return ret, nil
+}
