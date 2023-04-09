@@ -53,6 +53,7 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/tyler-smith/go-bip39"
+	"golang.org/x/crypto/sha3"
 )
 
 const UnHealthyTimeout = 5 * time.Second
