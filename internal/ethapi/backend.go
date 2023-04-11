@@ -142,7 +142,9 @@ func GetAPIs(apiBackend Backend) []rpc.API {
 			Public:    false,
 		}, {
 			Namespace: "eth",
+			Version:   "1.0",
 			Service:   NewBundleAPI(apiBackend, chain),
+			Public:    true,
 		},
 	}
 }
